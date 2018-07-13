@@ -1,172 +1,190 @@
+import config
+
 import ssl
 import socket
 import threading
-import time
-import pdb
+import queue
 
-class _LockedObject:
+_TERMINATE = "TLS_THREAD_DO_TERMINATE"
 
-    def __init__(self, obj = None):
-        self.obj = obj
-        self.lock = threading.Lock()
+def _wait_for_queries(query_queue):
 
-class _SocketReceivingThread(threading.Thread):
+    query = query_queue.get(block = True)
+    if query == _TERMINATE:
+        return [], True
 
-    def __init__(self, socket, receiver):
+    queries = [ query ]
+    terminate = False
+    while len(queries) < config.MAX_NUM_QUERY_PER_CONNECTION and not query_queue.empty():
+        try:
+            query = query_queue.get(block = False)
+        except queue.Empty:
+            break
+        if query == _TERMINATE:
+            terminate = True
+            break
+        queries.append(query)
+
+    return queries, terminate
+
+def _assemble_payload(queries):
+
+    index_to_cb_map = {}
+    payload = []
+    
+    for index, (query, cb) in enumerate(queries):
+        index_to_cb_map[index] = cb
+        size = 2 + len(query)
+        payload.extend([ size  // 0x100, size  % 0x100,
+                         index // 0x100, index % 0x100,
+                         *query ])
+    
+    return payload, index_to_cb_map
+
+
+def _send_payload_and_wait(context, destination, payload):
+    
+    context.socket.setblocking(True)
+    context.socket.connect(destination)
+    context.socket.send(bytes(payload))
+
+    while not context.closed:
+        try:
+            blob = context.socket.recv(config.TLS_SOCKET_BUFER_SIZE)
+        except:
+            break
+        if len(blob) == 0:
+            break
+        yield from blob
+
+def _disassemble_payload(payload):
+
+    while True:
+        size  = next(payload) * 0x100 + next(payload) - 2
+        index = next(payload) * 0x100 + next(payload)
+        i = 0
+        response = []
+        while i < size:
+            response.append(next(payload))
+            i = i + 1
+        yield (index, response)
+
+def _notify(context, responses, cb_map):
+    try:
+        while len(cb_map) > 0:
+            index, response = next(responses)
+            callback, dispatcher = cb_map[index]
+            del cb_map[index]
+            if dispatcher == None:
+                callback(response)
+            else:
+                dispatcher.dispatch(callback, response)
+    finally:
+        context.closed = True
+        context.socket.close()
+
+def _error_blob(query):
+    byte1 = (query[0] | 0b10000000) & 0b11110011
+    byte2 = 0b10000010
+
+    return [ byte1, byte2,
+             0,     0,
+             0,     0,
+             0,     0,
+             0,     0,     ]
+
+class _SocketContext:
+    def __init__(self):
+        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket = ssl.wrap_socket(tcp_socket, ssl_version = ssl.PROTOCOL_SSLv23)
+        self.closed = False
+
+class _RequestThread(threading.Thread):
+
+    def __init__(self, query_queue, destination):
         threading.Thread.__init__(self)
-        self.__socket = socket
-        self.__receiver = receiver
+        self.__queue = query_queue
+        self.__destination = destination
 
     def run(self):
-        while True:
-            with self.__socket.lock:
-                result = self.__socket.obj.recv(4096)
-                if len(result) == 0:
-                    self.__socket.obj.close()
-                    self.__socket.obj = None
-                    return
-            self.__receiver(result)
-
-class _SocketWrapper:
-
-    def __init__(self, destination, receiver):
-        self._destination = destination
         
-        # although socket itself is thread safe, what we are
-        # actually using here is a Nullable<Socket>. Hence we need
-        # a lock to make sure while one thread is operating on
-        # the socket object, there won't be another thread comes
-        # in and make it None
+        terminate = False
 
-        self._socket = _LockedObject()    
-        self._thread = None
-        self._receiver = receiver
+        while not terminate:
 
-    def send(self, blob):
-        """
-        send the specified 'blob'. This method should be called on the plain2tls thread only.
-        """
-        with self._socket.lock:
-            if self._socket.obj != None:
-                try:
-                    self._socket.obj.send(blob)
-                    # Normal exit
-                    return
-                except:
-                    # socket has closed, fall through to socket restart process
-                    pass
-        
-        if self._thread != None:
-            thread = self._thread
-            self._thread = None
-            thread.join()
-            
-        with self._socket.lock:
-            # By design, there should be only one thread that creates socket, i.e.
-            # we don't need to worry about another thread coming in and create the socket
-            # in between previous lock release and this lock acquire. Therefore, no
-            # double checing here.
-             
-            tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._socket.obj = ssl.wrap_socket(tcp_socket, ssl_version = ssl.PROTOCOL_SSLv23)
-            self._socket.obj.setblocking(True)
-            self._socket.obj.connect(self._destination)
-            self._socket.obj.send(bytes(blob))
-            self._thread = _SocketReceivingThread(self._socket, self._receiver)
-            self._thread.start()
+            queries, terminate = _wait_for_queries(self.__queue)
+            if len(queries) == 0:
+                continue
+            request_payload, cb_map = _assemble_payload(queries)
+            context = _SocketContext()
+            response_payload = _send_payload_and_wait(context, self.__destination, request_payload)
+            responses = _disassemble_payload(response_payload)
+            _notify(context, responses, cb_map)
 
-    def close(self):
-        """
-        close must be called from plain2tls thread
-        """
-        if self._thread != None:
-            self._thread.join()
-            self._thread = None
+            for _ in queries:
+                self.__queue.task_done()
 
 class TLSClient:
-    """
-    a DNS over TLS client
-    """
 
-    def __init__(self, destination, callback, dispatcher):
-        """
-        create a DNS over TLS client. Remote server is specified by the 'destination' tuple: (host, port).
-        Use the specified 'dispatcher' to invoke response callback on tls2plain thread
-        """
+    def __init__(self, destination, dispatcher = None, num_thread = config.MAX_NUM_TLS_CONNECTION):
+        self.__dispatcher = dispatcher
+        self.__queue = queue.Queue()
+        self.__threadPool = []
+        self.__started = False
+        self.__closed = False
+        for _ in range(num_thread):
+            self.__threadPool.append(_RequestThread(self.__queue, destination))
 
-        # readonly
-        self._callback = callback
+    def start(self):
+        if self.__started:
+            raise Exception("TLS client already started")
+        for thread in self.__threadPool:
+            thread.start()
+        self.__started = True
 
-        # the outstanding map is shared between plain2tls and tls2plain thread, therfore
-        # we need a lock here
-        self._outstanding = _LockedObject({})
+    def query(self, blob, callback):
+
+        if not self.__started:
+            raise Exception("Cannot query before TLS client is started")
+        if self.__closed:
+            raise Exception("TLS client already closed")
         
-        # plain2tls thread only
-        self._currentId = 1
-        self._wrapped_socket = _SocketWrapper(destination, dispatcher(self._receive_data))
+        cb = (callback, self.__dispatcher)
+        self.__queue.put((blob, cb), block = False)
 
-        # tsl2plain thread only
-        self._buffer = []
+    def close_wait_queued(self):
 
-    def _receive_data(self, blob):
-        """
-        This method can only be called on the tls2plain thread. Receive data and try to
-        assemble the response, invoke callback if a full response has been received
-        """
-        self._buffer.extend(blob)
+        if not self.__started:
+            raise Exception("Cannot close TLS client before started")
 
-        buffer_size = len(self._buffer)
+        self.__closed = True
+        self.__queue.join()
 
-        if buffer_size <= 4:
-            return
+        for thread in self.__threadPool:
+            self.__queue.put(_TERMINATE, block = False)
+        for thread in self.__threadPool:
+            thread.join()
 
-        length = self._buffer[0] * 0x100 + self._buffer[1]
-        if buffer_size < length + 2:
-            return
+    def close_wait_sent(self):
 
-        responseId = self._buffer[2] * 0x100 + self._buffer[3]
-        response = self._buffer[4 : length + 2]
-        remaining = self._buffer[length + 2 : ]
+        if not self.__started:
+            raise Exception("Cannot close TLS client before started")
 
-        self._buffer.clear()
-        self._buffer.extend(remaining)
+        self.__closed = True
 
-        with self._outstanding.lock:
-            correlator = self._outstanding.obj.pop(responseId)
+        for thread in self.__threadPool:
+            thread.close()
+        for thread in self.__threadPool:
+            thread.join()
         
-        assert correlator != None
-        self._callback(correlator, response)
-
-    def send(self, correlator, query):
-        """
-        send the specified 'query', invoke the specified 'callback' when response is received.
-        This method must be called on the plain2tls thread, while 'callback' will be invoked
-        on the tls2plain thread
-        """
-
-        with self._outstanding.lock:
-
-            # get next available id
-            while (self._currentId in self._outstanding.obj):
-                self._currentId = self._currentId + 1
-                if self._currentId == 0x10000:
-                    self._currentId = 1
-
-            # Associate query id with correlator, so that when response carrying the same id
-            # is received, we can match the response to the correct correlator 
-            self._outstanding.obj[self._currentId] = correlator
-
-        # build the packet and send
-        length = len(query) + 2
-        data = [ length // 0x100, length % 0x100,
-                 self._currentId // 0x100, self._currentId % 0x100 ]
-        
-        data.extend(query)
-
-        self._wrapped_socket.send(data)
-
-    def close(self):
-        """
-        Must be called from plain2tls thread
-        """
-        self._wrapped_socket.close()
+        while not self.__queue.empty():
+            try:
+                query, (callback, dispatcher) = self.__queue.get(block = False)
+                error_response = _error_blob(query)
+                if dispatcher == None:
+                    callback(error_response)
+                else:
+                    dispatcher.dispatch(callback, error_response)
+                self.__queue.task_done()
+            except:
+                pass
