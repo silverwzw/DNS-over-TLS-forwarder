@@ -1,4 +1,5 @@
 import config
+import util
 
 import ssl
 import socket
@@ -62,11 +63,7 @@ def _disassemble_payload(payload):
     while True:
         size  = next(payload) * 0x100 + next(payload) - 2
         index = next(payload) * 0x100 + next(payload)
-        i = 0
-        response = []
-        while i < size:
-            response.append(next(payload))
-            i = i + 1
+        response = [ next(payload) for _ in range(size) ]
         yield (index, response)
 
 def _notify(context, responses, cb_map):
@@ -82,16 +79,6 @@ def _notify(context, responses, cb_map):
     finally:
         context.closed = True
         context.socket.close()
-
-def _error_blob(query):
-    byte1 = (query[0] | 0b10000000) & 0b11110011
-    byte2 = 0b10000010
-
-    return [ byte1, byte2,
-             0,     0,
-             0,     0,
-             0,     0,
-             0,     0,     ]
 
 class _SocketContext:
     def __init__(self):
@@ -123,17 +110,18 @@ class _RequestThread(threading.Thread):
 
             for _ in queries:
                 self.__queue.task_done()
+        
+        # also mark terminate task as done
+        self.__queue.task_done()
 
 class TLSClient:
 
     def __init__(self, destination, dispatcher = None, num_thread = config.MAX_NUM_TLS_CONNECTION):
         self.__dispatcher = dispatcher
         self.__queue = queue.Queue()
-        self.__threadPool = []
         self.__started = False
         self.__closed = False
-        for _ in range(num_thread):
-            self.__threadPool.append(_RequestThread(self.__queue, destination))
+        self.__threadPool = [ _RequestThread(self.__queue, destination) for _ in range(num_thread) ]
 
     def start(self):
         if self.__started:
@@ -180,7 +168,7 @@ class TLSClient:
         while not self.__queue.empty():
             try:
                 query, (callback, dispatcher) = self.__queue.get(block = False)
-                error_response = _error_blob(query)
+                error_response = util.error_blob(query, util.ERROR_SERVER)
                 if dispatcher == None:
                     callback(error_response)
                 else:

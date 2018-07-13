@@ -7,12 +7,16 @@ def _key_factory(tp, name):
     # 2: NS
     # 5: CNAME
     # 15: MX
+    # 16: TXT
     # 28: AAAA
+    # 255: all
     prefix = "A" if tp == 1  else       \
              "N" if tp == 2  else       \
              "C" if tp == 5  else       \
              "M" if tp == 15 else       \
-             "6" if tp == 28 else None   
+             "T" if tp == 16 else       \
+             "6" if tp == 28 else       \
+             "*" if tp == 255 else None   
     return prefix + name if prefix != None else None
 
 _CacheEntry = collections.namedtuple("_CacheEntry", "data expire")
@@ -69,20 +73,15 @@ class DnsCache:
 
     def clean(self):
 
-        counter = 0
         current = int(time.time())
         expired = list()
 
-        for item in self._map.items():
-            if item[1].expire > current:
-                counter = counter + 1
-            else:
-                expired.append(item[0])
+        expired = [ item[0] for item in self._map.items() if item[1].expire <= current]
         
         for expired_key in expired:
             del self._map[expired_key]
         
-        for _ in range(counter - self._min_size):
+        for _ in range(len(self._map) - self._min_size):
             self._map.popitem(last = False)
 
         self._counter = self._min_size
